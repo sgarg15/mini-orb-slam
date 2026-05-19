@@ -112,3 +112,81 @@ pip install opencv-contrib-python numpy matplotlib
 cd src
 python main.py
 ```
+
+### KITTI odometry
+
+Use a KITTI odometry sequence folder as the input source. The code detects
+`calib.txt`, loads the correct projection matrix, and reads the matching image
+folder automatically.
+
+Expected layout:
+
+```text
+data/kitti/00/
+  calib.txt
+  image_0/
+    000000.png
+    000001.png
+    ...
+```
+
+Run grayscale camera 0:
+
+```bash
+python main.py ../data/kitti/00 --kitti-camera 0
+```
+
+With the KITTI folders in this repo, run sequence 00 like this:
+
+```bash
+cd src
+python main.py ../data/data_odometry_gray/dataset/sequences/00 --kitti-camera 0 --max-frames 300
+```
+
+For a quick terminal-only smoke test:
+
+```bash
+cd src
+python main.py ../data/data_odometry_gray/dataset/sequences/00 --kitti-camera 0 --max-frames 100 --no-viz
+```
+
+The source should be the `data_odometry_gray/.../sequences/00` folder because it
+contains `image_0/`. The `data_odometry_calib/.../sequences/00` folder contains
+calibration only and is useful for reference, but it does not contain frames.
+
+For KITTI color images, use camera 2:
+
+```bash
+python main.py ../data/kitti/00 --kitti-camera 2
+```
+
+KITTI odometry images are rectified, so distortion coefficients are not needed.
+Sequence 00 has 4541 frames, so start with `--max-frames 300` while tuning.
+
+With real camera calibration:
+
+```bash
+python main.py ../data/vid1.mp4 --calib ../data/calib.json
+```
+
+or explicit intrinsics:
+
+```bash
+python main.py ../data/vid1.mp4 --fx 718.856 --fy 718.856 --cx 607.1928 --cy 185.2157
+```
+
+Calibration files may be `.npz`, OpenCV `.yaml/.yml/.xml`, `.json`, `.txt`, or `.csv`.
+They should contain `K` / `camera_matrix` and may include `dist` / `dist_coeffs`.
+
+Keyframe insertion is intentionally lightweight for this mini version. Tune it with:
+
+```bash
+python main.py ../data/vid1.mp4 --keyframe-min-parallax 25 --keyframe-min-translation 0.15 --keyframe-min-frames 5
+```
+
+If the trajectory looks unstable, make initialization more conservative so the
+first map is not built from a near-pure-rotation / tiny-baseline pair:
+
+```bash
+python main.py ../data/vid1.mp4 --init-min-parallax 20 --max-pose-jump 8
+```
