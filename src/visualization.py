@@ -30,3 +30,31 @@ def plot_3d(points_3d, R, t):
     ax.legend()
     plt.tight_layout()
     plt.show()
+
+
+def plot_trajectory(trajectory, map_points=None):
+    """Plot the camera trajectory and sparse map in 3D.
+
+    trajectory: list of (R, t) where X_cam = R @ X_world + t.
+    map_points: optional Nx3 array of 3D map points.
+    """
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Camera center in world: C = -R.T @ t
+    centers = np.array([(-R.T @ t).ravel() for R, t in trajectory])
+
+    ax.plot(centers[:, 0], centers[:, 1], centers[:, 2],
+            'b-o', markersize=3, linewidth=1.2, label='Trajectory')
+    ax.scatter(*centers[0], c='green', s=80, marker='^', zorder=5, label='Start')
+    ax.scatter(*centers[-1], c='red', s=80, marker='^', zorder=5, label='End')
+
+    if map_points is not None and len(map_points) > 0:
+        ax.scatter(map_points[:, 0], map_points[:, 1], map_points[:, 2],
+                   s=1, c=map_points[:, 2], cmap='plasma', alpha=0.4, label='Map points')
+
+    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+    ax.set_title(f'Camera Trajectory  ({len(trajectory)} frames,  {len(map_points) if map_points is not None else 0} map points)')
+    ax.legend()
+    plt.tight_layout()
+    plt.show()

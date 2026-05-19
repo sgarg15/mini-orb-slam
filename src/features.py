@@ -11,12 +11,12 @@ def detect(img, nfeatures=2000, scale_factor=1.2, nlevels=8):
     kp, des = orb.detectAndCompute(img, None)
     return kp, des
 
+
 # Match descriptors using Brute-Force matcher with Hamming distance and apply Lowe's ratio test
 def match(des1, des2, ratio=0.75):
     # Use Brute-Force matcher with Hamming distance for ORB descriptors
     # Used Brute-Force matcher because it is simple and effective for small to medium-sized descriptor sets, and Hamming distance is suitable for binary descriptors like ORB.
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-
     # Perform k-nearest neighbor matching (k=2)
     raw = bf.knnMatch(des1, des2, k=2)
     # Apply Lowe's ratio test to filter out ambiguous matches. A match is considered good if the distance of the best match is less than a specified ratio (e.g., 0.75) of the distance of the second-best match.
@@ -25,10 +25,32 @@ def match(des1, des2, ratio=0.75):
     good.sort(key=lambda x: x.distance)
     return raw, good
 
-# 
+
 def matched_points(kp1, kp2, matches):
-    # Extract matched keypoint coordinates from the keypoint lists based on the matches. The queryIdx (index into kp1 which is the query image) and trainIdx (index into kp2 which is the train image) 
+    # Extract matched keypoint coordinates from the keypoint lists based on the matches. The queryIdx (index into kp1 which is the query image) and trainIdx (index into kp2 which is the train image)
     # attributes of the match objects are used to index into the keypoint lists to retrieve the (x, y) coordinates of the matched keypoints.
     pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
     return pts1, pts2
+
+
+def match_to_map(des_frame, map_descriptors, ratio=0.75):
+    """Match new-frame descriptors against the map's stored descriptors.
+
+    Returns (frame_indices, map_indices): parallel integer arrays of matched indices,
+    where frame_indices[i] indexes into the new frame's keypoints and
+    map_indices[i] indexes into the map points array.
+    """
+    if map_descriptors is None or len(map_descriptors) == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    raw = bf.knnMatch(des_frame, map_descriptors, k=2)
+    frame_idx, map_idx = [], []
+    for pair in raw:
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance < ratio * n.distance:
+            frame_idx.append(m.queryIdx)
+            map_idx.append(m.trainIdx)
+    return np.array(frame_idx, dtype=int), np.array(map_idx, dtype=int)
