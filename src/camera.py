@@ -2,15 +2,17 @@ import numpy as np
 
 
 def build_K(img_shape):
+    # Simple pinhole camera model with focal length = 0.9 * image width, and principal point at the center
     h, w = img_shape[:2]
     focal = 0.9 * w
     cx, cy = w / 2.0, h / 2.0
+    # Camera intrinsic matrix K
     K = np.array([[focal, 0, cx],
                   [0, focal, cy],
                   [0,     0,  1]], dtype=np.float64)
     return K
 
-
+# Helper function to print the camera intrinsics in a readable format
 def print_K(K, img_shape):
     h, w = img_shape[:2]
     focal = K[0, 0]
@@ -19,5 +21,5 @@ def print_K(K, img_shape):
     print(f"Focal length: {focal:.1f} px  (reasonable range: {0.5*w:.0f}–{2*w:.0f})")
     print(f"Principal point: ({K[0,2]:.1f}, {K[1,2]:.1f})")
     if focal < 0.3 * w or focal > 3 * w:
-        print("WARNING: focal length looks unreasonable — check K!")
+        print("WARNING: focal length looks unreasonable, check K")
     print()
