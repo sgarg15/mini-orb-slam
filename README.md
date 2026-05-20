@@ -143,6 +143,25 @@ cd src
 python main.py ../data/data_odometry_gray/dataset/sequences/00 --kitti-camera 0 --max-frames 300
 ```
 
+The final matplotlib dashboard shows the 3D/top-down trajectory, orange
+keyframe markers, and a strip of recent keyframe images. Increase or decrease
+the image strip with:
+
+```bash
+python main.py ../data/data_odometry_gray/dataset/sequences/00 --kitti-camera 0 --max-frames 300 --keyframe-thumbs 12
+```
+
+For a realtime KITTI demo, stream the image sequence directly and update the
+matplotlib dashboard while tracking:
+
+```bash
+cd ..
+.\.venv\Scripts\python.exe src\main.py data\data_odometry_gray\dataset\sequences\00 --kitti-camera 0 --max-frames 300 --live --live-fps 10 --live-every 1
+```
+
+Use `--no-final-viz` if you only want the live dashboard and do not want the
+final blocking matplotlib summary after processing finishes.
+
 For a quick terminal-only smoke test:
 
 ```bash
@@ -181,7 +200,7 @@ They should contain `K` / `camera_matrix` and may include `dist` / `dist_coeffs`
 Keyframe insertion is intentionally lightweight for this mini version. Tune it with:
 
 ```bash
-python main.py ../data/vid1.mp4 --keyframe-min-parallax 25 --keyframe-min-translation 0.15 --keyframe-min-frames 5
+python main.py ../data/vid1.mp4 --keyframe-min-parallax 20 --keyframe-min-translation 0.15 --keyframe-min-frames 2
 ```
 
 If the trajectory looks unstable, make initialization more conservative so the

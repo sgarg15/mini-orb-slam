@@ -92,6 +92,7 @@ def solve_pnp(points_3d, pts2d, K):
     """
     if len(points_3d) < 6:
         return None, None, None
+    # Using Ransac PnP (Pnp is Perspective-n-Point, which estimates the pose of a calibrated camera given a set of 3D points in the world and their corresponding 2D projections in the image). We use RANSAC to be robust to outliers in the correspondences. 
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
         points_3d.astype(np.float64),
         pts2d.astype(np.float64),
@@ -105,6 +106,8 @@ def solve_pnp(points_3d, pts2d, K):
     if not success or inliers is None or len(inliers) < 4:
         return None, None, None
     R, _ = cv2.Rodrigues(rvec)
+    
+    # The function returns the estimated rotation vector (rvec), translation vector (tvec), and the indices of inlier correspondences that were consistent with the estimated pose.
     return R, tvec, inliers.flatten()
 
 

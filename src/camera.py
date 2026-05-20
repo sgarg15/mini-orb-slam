@@ -136,12 +136,18 @@ def load_calibration(path):
 
 
 def undistort_frame(img, K, dist):
+    """
+    Undistort an image using the given camera intrinsics and distortion coefficients.
+    """
     if dist is None or len(dist) == 0:
         return img
     return cv2.undistort(img, K, dist)
 
 
 def print_K(K, img_shape, source="estimated", dist=None):
+    """
+    Print the camera intrinsics and distortion in a human-readable format, along with some sanity checks.
+    """
     h, w = img_shape[:2]
     print("--- Camera Intrinsics ---")
     print(f"Source: {source}")
