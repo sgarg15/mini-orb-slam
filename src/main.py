@@ -66,32 +66,12 @@ def load_camera(args):
     return K, dist, f"{calib_path}:P{args.kitti_camera}"
 
 
-def main():
-    args = parse_args()
+def _find_init_frame(gen, img0, K, dist, args):
+    """Search gen for a second frame with enough parallax to initialize the map.
 
-    image_dir = kitti_image_dir(args.source, args.kitti_camera)
-    if image_dir is None:
-        print(f"'{args.source}' is not a KITTI sequence directory")
-        sys.exit(1)
-    # Get a generator for the undistorted frames, so we can stop early if there are no frames or if we reach max_frames
-    gen = frames_from_dir(image_dir, max_frames=args.max_frames)
-
-    img0 = next(gen, None)
-    if img0 is None:
-        print("No frames found")
-        sys.exit(1)
-
-    try:
-        K, dist, k_source = load_camera(args)
-    except (OSError, ValueError, KeyError) as exc:
-        print(f"Calibration error: {exc}")
-        sys.exit(1)
-
-    # Print the loaded intrinsics and distortion for confirmation, and undistort the first frame
-    print_K(K, img0.shape, source=k_source, dist=dist)
-    img0 = undistort_frame(img0, K, dist)
-
-    # Initialization: find the first frame with enough parallax to img0 to initialize the map.
+    May advance img0 to a later anchor frame if feature overlap is lost.
+    Returns (img0_anchor, img1, result) or calls sys.exit on failure.
+    """
     max_init_search = 300
     lost_overlap_threshold = 8
     result = None
@@ -117,7 +97,8 @@ def main():
                 n_matches = int(last_reason.split()[1])
             except (ValueError, IndexError):
                 n_matches = 0
-            # if we see a frame with some feature matches but not enough paralax to init, we move the anchor to that frame
+            # Move the anchor forward when feature overlap is nearly lost so subsequent
+            # frames are more likely to share enough features for initialization.
             if n_matches < lost_overlap_threshold:
                 img0 = candidate
                 anchor_frame = skipped
@@ -129,30 +110,32 @@ def main():
             print(f"\nCould not initialise after {max_init_search} frames.")
             print(f"Last failure: {last_reason}")
             print("Suggestions:")
-            print("  - Use real camera intrinsics and distortion with --calib or --fx/--fy/--cx/--cy.")
             print("  - Record translating camera motion; pure rotation cannot triangulate monocular depth.")
-            print("  - Try a smaller --step if features move too far between processed frames.")
             sys.exit(1)
 
     if result is None:
         print("Not enough frames to initialise the map")
         sys.exit(1)
 
-    map3d, map_des, R01, t01, kp0, kp1, des1, good01, inlier_mask = result
+    return img0, img1, result
 
-    # Create an init trajectory with the R01 and t01 which are the pose of the second frame relative to the first frame
+
+def _track_frames(gen, K, dist, img0, img1, result, args):
+    """Run the main PnP tracking loop over remaining frames.
+
+    Returns (trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user).
+    """
+    map3d, map_des, R01, t01, _, kp1, des1, _, inlier_mask = result
+
     trajectory = [
         (np.eye(3), np.zeros((3, 1))),
         (R01, t01),
     ]
-
-    # Create a list of keyframe views for visualization, starting with the two init frame.
     keyframe_views = [
         {"frame": 0, "image": img0.copy(), "mode": "init", "trajectory_index": 0},
         {"frame": 1, "image": img1.copy(), "mode": "init", "trajectory_index": 1},
     ]
 
-    # Setup the variables for the main tracking loop
     key_kp, key_des = kp1, des1
     key_R, key_t = R01, t01
     keyframes = 2
@@ -182,16 +165,12 @@ def main():
         live_viewer.update(trajectory, map3d, img1, keyframe_views, status)
         last_live_update = time.perf_counter()
 
-    # Main tracking loop: for each subsequent frame, track it with PnP against the map. If that fails, optionally fall back to frame-to-frame VO using Essential Matrix. If tracking succeeds, decide whether to add a new keyframe and expand the map with triangulation.
     for img_i in gen:
-        # Undistort the frame before processing, since both tracking and visualization assume undistorted frames. We need to do this before tracking so that the keypoints are detected in the undistorted image and match the map points which were triangulated in undistorted pixel coordinates.
         img_i = undistort_frame(img_i, K, dist)
         i = total
-        # Using the track_frame, we attempt to track the current frame against the map with PnP
         R_i, t_i, n_inliers, n_matches, kp_i, des_i = track_frame(img_i, K, map3d, map_des)
         mode = "PnP"
         pose_jump = None
-        
 
         if R_i is not None:
             pose_jump = np.linalg.norm(camera_center(R_i, t_i) - camera_center(prev_R, prev_t))
@@ -217,11 +196,9 @@ def main():
         if R_i is None:
             print(f"Frame {i:4d}: FAILED  (map matches={n_matches}, PnP inliers={n_inliers})")
         else:
-            # Add the pose to the trajectory
             trajectory.append((R_i, t_i))
             trajectory_index = len(trajectory) - 1
 
-            # Decide whether to add a new keyframe. We check the median parallax of the matches to the current keyframe, the translation of the camera center from the last keyframe, and how many frames have passed since the last keyframe. If we add a new keyframe, we also expand the map with new triangulated points from the last keyframe to the current frame.
             add_keyframe, parallax, delta, _ = should_add_keyframe(
                 key_kp, key_des, key_R, key_t,
                 kp_i, des_i, R_i, t_i,
@@ -233,7 +210,7 @@ def main():
                     map3d, map_des, K,
                     key_kp, key_des, key_R, key_t,
                     kp_i, des_i, R_i, t_i)
-                
+
                 key_kp, key_des = kp_i, des_i
                 key_R, key_t = R_i, t_i
                 keyframes += 1
@@ -252,42 +229,38 @@ def main():
                       f"jump={pose_jump:.2f}  trans={delta:.2f}  map={len(map3d):6d}")
 
             if live_enabled:
-                should_update_live = True
-                if should_update_live:
-                    now = time.perf_counter()
-                    sleep_for = live_min_dt - (now - last_live_update)
-                    if sleep_for > 0:
-                        time.sleep(sleep_for)
-                    status = {
-                        "frame": i,
-                        "mode": "KEYFRAME " + mode.strip() if add_keyframe else mode.strip(),
-                        "inliers": n_inliers,
-                        "map_points": len(map3d),
-                        "keyframes": keyframes,
-                        "message": f"parallax={parallax:.1f}px  trans={delta:.2f}",
-                    }
-                    if not live_viewer.update(trajectory, map3d, img_i, keyframe_views, status):
-                        print("Live viewer closed; stopping run.")
-                        live_stopped_by_user = True
-                        total += 1
-                        break
-                    last_live_update = time.perf_counter()
+                now = time.perf_counter()
+                sleep_for = live_min_dt - (now - last_live_update)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                status = {
+                    "frame": i,
+                    "mode": "KEYFRAME " + mode.strip() if add_keyframe else mode.strip(),
+                    "inliers": n_inliers,
+                    "map_points": len(map3d),
+                    "keyframes": keyframes,
+                    "message": f"parallax={parallax:.1f}px  trans={delta:.2f}",
+                }
+                if not live_viewer.update(trajectory, map3d, img_i, keyframe_views, status):
+                    print("Live viewer closed; stopping run.")
+                    live_stopped_by_user = True
+                    total += 1
+                    break
+                last_live_update = time.perf_counter()
 
             prev_R, prev_t = R_i, t_i
             prev_kp, prev_des = kp_i, des_i
 
         total += 1
 
-    print(f"\nTracked {len(trajectory)} / {total} frames")
-    print(f"Keyframes: {keyframes}")
-    print(f"Final map: {len(map3d)} 3D points")
+    return trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user
 
-    if args.no_viz:
+
+def _show_final_viz(args, trajectory, map3d, keyframe_views,
+                    img0, kp0, img1, kp1, good01, inlier_mask, R01, t01,
+                    live_stopped_by_user):
+    if args.no_viz or live_stopped_by_user:
         return
-
-    if live_stopped_by_user:
-        return
-
     if args.live and args.no_final_viz:
         return
 
@@ -303,6 +276,44 @@ def main():
 
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+
+def main():
+    args = parse_args()
+
+    image_dir = kitti_image_dir(args.source, args.kitti_camera)
+    if image_dir is None:
+        print(f"'{args.source}' is not a KITTI sequence directory")
+        sys.exit(1)
+    gen = frames_from_dir(image_dir, max_frames=args.max_frames)
+
+    img0 = next(gen, None)
+    if img0 is None:
+        print("No frames found")
+        sys.exit(1)
+
+    try:
+        K, dist, k_source = load_camera(args)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"Calibration error: {exc}")
+        sys.exit(1)
+
+    print_K(K, img0.shape, source=k_source, dist=dist)
+    img0 = undistort_frame(img0, K, dist)
+
+    img0, img1, result = _find_init_frame(gen, img0, K, dist, args)
+    map3d, _, R01, t01, kp0, kp1, _, good01, inlier_mask = result
+
+    trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user = _track_frames(
+        gen, K, dist, img0, img1, result, args)
+
+    print(f"\nTracked {len(trajectory)} / {total} frames")
+    print(f"Keyframes: {keyframes}")
+    print(f"Final map: {len(map3d)} 3D points")
+
+    _show_final_viz(args, trajectory, map3d, keyframe_views,
+                    img0, kp0, img1, kp1, good01, inlier_mask, R01, t01,
+                    live_stopped_by_user)
 
 
 if __name__ == "__main__":
