@@ -22,7 +22,7 @@ def parse_args():
                         help="KITTI sequence directory (default: ../data)")
     parser.add_argument("--kitti-camera", type=int, choices=(0, 1, 2, 3), default=0,
                         help="KITTI camera stream to use (default: 0)")
-    parser.add_argument("--keyframe-min-parallax", type=float, default=20.0,
+    parser.add_argument("--keyframe-min-parallax", type=float, default=25.0,
                         help="Median keypoint displacement in pixels required for a new keyframe")
     parser.add_argument("--keyframe-min-translation", type=float, default=0.15,
                         help="Minimum camera-center translation in arbitrary monocular scale")

@@ -155,8 +155,7 @@ For a realtime KITTI demo, stream the image sequence directly and update the
 matplotlib dashboard while tracking:
 
 ```bash
-cd ..
-.\.venv\Scripts\python.exe src\main.py data\data_odometry_gray\dataset\sequences\00 --kitti-camera 0 --max-frames 300 --live --live-fps 10 --live-every 1
+python src\main.py data\data_odometry_gray\dataset\sequences\00 --kitti-camera 0 --max-frames 300 --live
 ```
 
 Use `--no-final-viz` if you only want the live dashboard and do not want the
