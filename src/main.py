@@ -1,7 +1,9 @@
 import argparse
+import json
 import os
 import sys
 import time
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -9,9 +11,9 @@ import numpy as np
 from camera import load_kitti_calibration, print_K, undistort_frame
 from sources import frames_from_dir, kitti_image_dir, kitti_sequence_dir
 from slam import (
-    MIN_INIT_PARALLAX, MIN_VO_INLIERS,
+    DUPLICATE_POINT_RADIUS, MAX_MAP_POINT_DISTANCE, MIN_INIT_PARALLAX, MIN_VO_INLIERS,
     camera_center, compose_pose, estimate_relative_pose,
-    expand_map, init_map, should_add_keyframe, track_frame,
+    cull_map_points, expand_map, init_map, should_add_keyframe, track_frame,
 )
 from visualization import LiveSlamViewer, plot_3d, plot_trajectory, show_inlier_matches
 
@@ -46,6 +48,12 @@ def parse_args():
                         help="Arbitrary monocular scale for each frame-to-frame VO fallback step")
     parser.add_argument("--vo-min-inliers", type=int, default=MIN_VO_INLIERS,
                         help="Minimum Essential Matrix inliers for VO fallback")
+    parser.add_argument("--max-map-point-distance", type=float, default=MAX_MAP_POINT_DISTANCE,
+                        help="Reject new map points farther than this world-frame distance from the origin")
+    parser.add_argument("--duplicate-point-radius", type=float, default=DUPLICATE_POINT_RADIUS,
+                        help="Reject new map points closer than this distance to an existing/new map point")
+    parser.add_argument("--min-map-observations", type=int, default=2,
+                        help="Cull map points observed fewer than this many times after keyframe insertion")
     return parser.parse_args()
 
 
@@ -70,7 +78,7 @@ def _find_init_frame(gen, img0, K, dist, args):
     """Search gen for a second frame with enough parallax to initialize the map.
 
     May advance img0 to a later anchor frame if feature overlap is lost.
-    Returns (img0_anchor, img1, result) or calls sys.exit on failure.
+    Returns (img0_anchor, img1, result, frames_consumed) or calls sys.exit on failure.
     """
     max_init_search = 300
     lost_overlap_threshold = 8
@@ -117,15 +125,16 @@ def _find_init_frame(gen, img0, K, dist, args):
         print("Not enough frames to initialise the map")
         sys.exit(1)
 
-    return img0, img1, result
+    return img0, img1, result, skipped + 1
 
 
 def _track_frames(gen, K, dist, img0, img1, result, args):
     """Run the main PnP tracking loop over remaining frames.
 
-    Returns (trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user).
+    Returns (trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user, metrics).
     """
     map3d, map_des, R01, t01, _, kp1, des1, _, inlier_mask = result
+    map_obs = np.full(len(map3d), 2, dtype=np.int32)
 
     trajectory = [
         (np.eye(3), np.zeros((3, 1))),
@@ -148,6 +157,17 @@ def _track_frames(gen, K, dist, img0, img1, result, args):
     live_min_dt = 1.0 / 10.0
     last_live_update = 0.0
     live_stopped_by_user = False
+    metrics = {
+        "tracking_failures": 0,
+        "keyframes_inserted": 0,
+        "map_points_created": int(len(map3d)),
+        "map_points_culled": 0,
+        "rejected_far_points": 0,
+        "rejected_duplicate_points": 0,
+        "pnp_inliers": [int(inlier_mask.sum())],
+        "pnp_reprojection_errors": [],
+        "tracking_seconds": 0.0,
+    }
 
     if args.live and args.no_viz:
         print("Note: --live is ignored because --no-viz is set")
@@ -165,10 +185,13 @@ def _track_frames(gen, K, dist, img0, img1, result, args):
         live_viewer.update(trajectory, map3d, img1, keyframe_views, status)
         last_live_update = time.perf_counter()
 
+    tracking_started = time.perf_counter()
+
     for img_i in gen:
         img_i = undistort_frame(img_i, K, dist)
         i = total
-        R_i, t_i, n_inliers, n_matches, kp_i, des_i = track_frame(img_i, K, map3d, map_des)
+        R_i, t_i, n_inliers, n_matches, kp_i, des_i, map_inliers, reproj_errors = track_frame(
+            img_i, K, map3d, map_des)
         mode = "PnP"
         pose_jump = None
 
@@ -186,18 +209,27 @@ def _track_frames(gen, K, dist, img0, img1, result, args):
                 pose_jump = np.linalg.norm(camera_center(R_i, t_i) - camera_center(prev_R, prev_t))
                 n_inliers = vo_inliers
                 n_matches = 0
+                map_inliers = np.array([], dtype=int)
+                reproj_errors = np.array([], dtype=np.float64)
                 mode = "VO "
             else:
                 print(f"Frame {i:4d}: FAILED  (map matches={n_matches}, PnP inliers={n_inliers}, "
                       f"VO inliers={vo_inliers}, VO parallax={vo_parallax:.1f}px)")
+                metrics["tracking_failures"] += 1
                 total += 1
                 continue
 
         if R_i is None:
             print(f"Frame {i:4d}: FAILED  (map matches={n_matches}, PnP inliers={n_inliers})")
+            metrics["tracking_failures"] += 1
         else:
             trajectory.append((R_i, t_i))
             trajectory_index = len(trajectory) - 1
+            if mode.strip() == "PnP":
+                metrics["pnp_inliers"].append(int(n_inliers))
+                metrics["pnp_reprojection_errors"].extend([float(e) for e in reproj_errors if np.isfinite(e)])
+                if len(map_inliers) > 0:
+                    np.add.at(map_obs, map_inliers, 1)
 
             add_keyframe, parallax, delta, _ = should_add_keyframe(
                 key_kp, key_des, key_R, key_t,
@@ -206,10 +238,19 @@ def _track_frames(gen, K, dist, img0, img1, result, args):
                 i - last_keyframe_frame, args.keyframe_min_frames)
 
             if add_keyframe:
-                map3d, map_des, n_new = expand_map(
-                    map3d, map_des, K,
+                map3d, map_des, map_obs, n_new, hygiene = expand_map(
+                    map3d, map_des, map_obs, K,
                     key_kp, key_des, key_R, key_t,
-                    kp_i, des_i, R_i, t_i)
+                    kp_i, des_i, R_i, t_i,
+                    max_point_distance=args.max_map_point_distance,
+                    duplicate_radius=args.duplicate_point_radius)
+                map3d, map_des, map_obs, n_culled = cull_map_points(
+                    map3d, map_des, map_obs, args.min_map_observations)
+                metrics["keyframes_inserted"] += 1
+                metrics["map_points_created"] += int(n_new)
+                metrics["map_points_culled"] += int(n_culled)
+                metrics["rejected_far_points"] += int(hygiene["rejected_far"])
+                metrics["rejected_duplicate_points"] += int(hygiene["rejected_duplicate"])
 
                 key_kp, key_des = kp_i, des_i
                 key_R, key_t = R_i, t_i
@@ -222,7 +263,8 @@ def _track_frames(gen, K, dist, img0, img1, result, args):
                     "trajectory_index": trajectory_index,
                 })
                 print(f"Frame {i:4d}: KEYFRAME  {mode} inliers={n_inliers:3d}  "
-                      f"parallax={parallax:5.1f}px  trans={delta:.2f}  +{n_new} pts  map={len(map3d):6d}")
+                      f"parallax={parallax:5.1f}px  trans={delta:.2f}  "
+                      f"+{n_new} pts  -{n_culled} culled  map={len(map3d):6d}")
             else:
                 print(f"Frame {i:4d}: tracked   {mode} inliers={n_inliers:3d}  "
                       f"matches={n_matches:3d}  parallax={parallax:5.1f}px  "
@@ -253,12 +295,23 @@ def _track_frames(gen, K, dist, img0, img1, result, args):
 
         total += 1
 
-    return trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user
+    metrics["tracking_seconds"] = time.perf_counter() - tracking_started
+    metrics["final_observation_counts"] = map_obs
+    return trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user, metrics
+
+
+def _run_save_paths():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    save_dir = os.path.join(repo_root, "docs", "runs")
+    os.makedirs(save_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = os.path.join(save_dir, f"run_{stamp}")
+    return f"{stem}.png", f"{stem}_summary.json"
 
 
 def _show_final_viz(args, trajectory, map3d, keyframe_views,
                     img0, kp0, img1, kp1, good01, inlier_mask, R01, t01,
-                    live_stopped_by_user):
+                    live_stopped_by_user, save_path):
     if args.no_viz or live_stopped_by_user:
         return
     if args.live and args.no_final_viz:
@@ -268,14 +321,60 @@ def _show_final_viz(args, trajectory, map3d, keyframe_views,
         show_inlier_matches(img0, kp0, img1, kp1, good01, inlier_mask)
 
     if len(trajectory) == 2:
-        plot_3d(map3d, R01, t01)
+        plot_3d(map3d, R01, t01, save_path=save_path)
     else:
         plot_trajectory(trajectory, map3d,
                         keyframes=keyframe_views,
-                        max_keyframe_thumbs=8)
+                        max_keyframe_thumbs=8,
+                        save_path=save_path)
 
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+
+def _build_summary(total, init_frames_processed, trajectory, keyframes, map3d, metrics, args):
+    pnp_inliers = metrics["pnp_inliers"]
+    reproj_errors = metrics["pnp_reprojection_errors"]
+    tracking_seconds = metrics["tracking_seconds"]
+    mean_fps = (max(total - 2, 0) / tracking_seconds) if tracking_seconds > 0 else 0.0
+    obs = metrics["final_observation_counts"]
+    frames_processed = init_frames_processed + max(total - 2, 0)
+    return {
+        "frames_processed": int(frames_processed),
+        "accepted_poses": int(len(trajectory)),
+        "tracking_failures": int(metrics["tracking_failures"]),
+        "keyframes_inserted": int(metrics["keyframes_inserted"]),
+        "keyframes_total": int(keyframes),
+        "map_points_created": int(metrics["map_points_created"]),
+        "map_points_final": int(len(map3d)),
+        "map_points_culled": int(metrics["map_points_culled"]),
+        "min_map_observations": int(args.min_map_observations),
+        "map_points_observed_fewer_than_min": int(np.count_nonzero(obs < args.min_map_observations)) if len(obs) else 0,
+        "rejected_far_points": int(metrics["rejected_far_points"]),
+        "rejected_duplicate_points": int(metrics["rejected_duplicate_points"]),
+        "mean_pnp_inliers": float(np.mean(pnp_inliers)) if pnp_inliers else 0.0,
+        "median_reprojection_error_px": float(np.median(reproj_errors)) if reproj_errors else 0.0,
+        "mean_tracking_fps": float(mean_fps),
+    }
+
+
+def _print_summary(summary):
+    print("\nFinal run summary")
+    print(f"Frames processed: {summary['frames_processed']}")
+    print(f"Accepted poses: {summary['accepted_poses']}")
+    print(f"Tracking failures: {summary['tracking_failures']}")
+    print(f"Keyframes inserted: {summary['keyframes_inserted']}")
+    print(f"Map points created: {summary['map_points_created']}")
+    print(f"Mean PnP inliers: {summary['mean_pnp_inliers']:.1f}")
+    print(f"Median reprojection error: {summary['median_reprojection_error_px']:.2f} px")
+    print(f"Mean tracking FPS: {summary['mean_tracking_fps']:.1f}")
+
+
+def _save_summary(summary, save_path):
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+        f.write("\n")
+    print(f"Saved run summary -> {save_path}")
 
 
 def main():
@@ -301,19 +400,21 @@ def main():
     print_K(K, img0.shape, source=k_source, dist=dist)
     img0 = undistort_frame(img0, K, dist)
 
-    img0, img1, result = _find_init_frame(gen, img0, K, dist, args)
+    img0, img1, result, init_frames_processed = _find_init_frame(gen, img0, K, dist, args)
     map3d, _, R01, t01, kp0, kp1, _, good01, inlier_mask = result
 
-    trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user = _track_frames(
+    plot_path, summary_path = _run_save_paths()
+
+    trajectory, map3d, keyframe_views, keyframes, total, live_stopped_by_user, metrics = _track_frames(
         gen, K, dist, img0, img1, result, args)
 
-    print(f"\nTracked {len(trajectory)} / {total} frames")
-    print(f"Keyframes: {keyframes}")
-    print(f"Final map: {len(map3d)} 3D points")
+    summary = _build_summary(total, init_frames_processed, trajectory, keyframes, map3d, metrics, args)
+    _print_summary(summary)
+    _save_summary(summary, summary_path)
 
     _show_final_viz(args, trajectory, map3d, keyframe_views,
                     img0, kp0, img1, kp1, good01, inlier_mask, R01, t01,
-                    live_stopped_by_user)
+                    live_stopped_by_user, plot_path)
 
 
 if __name__ == "__main__":

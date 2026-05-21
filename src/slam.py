@@ -2,13 +2,15 @@ import cv2
 import numpy as np
 
 from features import detect, match, matched_points, match_to_map
-from geometry import estimate_pose, reprojection_error, solve_pnp, triangulate, triangulate_poses
+from geometry import estimate_pose, project_points, reprojection_error, solve_pnp, triangulate, triangulate_poses
 
 MIN_INIT_POINTS = 10
 MIN_INIT_INLIERS = 8
 MIN_PNP_INLIERS = 20
 MIN_INIT_PARALLAX = 15.0
 MIN_VO_INLIERS = 40
+MAX_MAP_POINT_DISTANCE = 80.0
+DUPLICATE_POINT_RADIUS = 0.25
 
 
 def init_map(img0, img1, K, min_parallax=MIN_INIT_PARALLAX):
@@ -91,15 +93,19 @@ def track_frame(img, K, map3d, map_des):
         kp: list of keypoints detected in the current frame
         
         des: descriptors for the keypoints detected in the current frame
+
+        map_inliers: indices of map points that were PnP inliers
+
+        reproj_errors: reprojection errors for PnP inlier correspondences
     """
 
     kp, des = detect(img)
     if des is None or len(des) == 0:
-        return None, None, 0, 0, kp, des
+        return None, None, 0, 0, kp, des, np.array([], dtype=int), np.array([], dtype=np.float64)
 
     frame_idx, map_idx = match_to_map(des, map_des)
     if len(frame_idx) < 6:
-        return None, None, 0, len(frame_idx), kp, des
+        return None, None, 0, len(frame_idx), kp, des, np.array([], dtype=int), np.array([], dtype=np.float64)
 
     # Get the 2D-3D correspondences for PnP. The 2D points are the keypoints in the current frame corresponding to the matched descriptors, and the 3D points are the map points corresponding to those descriptors.
     pts2d = np.array([kp[j].pt for j in frame_idx], dtype=np.float64)
@@ -109,10 +115,16 @@ def track_frame(img, K, map3d, map_des):
     R, t, inliers = solve_pnp(pts3d, pts2d, K)
     n_inliers = len(inliers) if inliers is not None else 0
     if n_inliers < MIN_PNP_INLIERS:
-        return None, None, n_inliers, len(frame_idx), kp, des
+        return None, None, n_inliers, len(frame_idx), kp, des, np.array([], dtype=int), np.array([], dtype=np.float64)
+
+    inlier_pts3d = pts3d[inliers]
+    inlier_pts2d = pts2d[inliers]
+    proj = project_points(inlier_pts3d, K, R, t)
+    reproj_errors = np.linalg.norm(inlier_pts2d - proj, axis=1)
+    map_inliers = map_idx[inliers]
     
     # Return the pose of the current frame, the number of inliers, the total number of matches to the map, and the detected keypoints and descriptors for potential use in visualization or future matching.
-    return R, t, n_inliers, len(frame_idx), kp, des
+    return R, t, n_inliers, len(frame_idx), kp, des, map_inliers, reproj_errors
 
 
 def camera_center(R, t):
@@ -181,27 +193,85 @@ def should_add_keyframe(key_kp, key_des, key_R, key_t,
     return add, parallax, delta, n_matches
 
 
-def expand_map(map3d, map_des, K, key_kp, key_des, key_R, key_t, curr_kp, curr_des, curr_R, curr_t):
+def _distance_filter(points_3d, max_distance):
+    if len(points_3d) == 0:
+        return np.array([], dtype=bool)
+    return np.linalg.norm(points_3d, axis=1) <= max_distance
+
+
+def _duplicate_filter(points_3d, existing_points, radius):
+    """Keep points that are not near existing points or earlier new points."""
+    if len(points_3d) == 0:
+        return np.array([], dtype=bool)
+    keep = np.ones(len(points_3d), dtype=bool)
+    radius2 = radius * radius
+    for i, point in enumerate(points_3d):
+        if len(existing_points) > 0 and np.any(np.sum((existing_points - point) ** 2, axis=1) < radius2):
+            keep[i] = False
+            continue
+        if i > 0 and np.any(np.sum((points_3d[:i][keep[:i]] - point) ** 2, axis=1) < radius2):
+            keep[i] = False
+    return keep
+
+
+def cull_map_points(map3d, map_des, map_obs, min_observations):
+    if min_observations <= 1 or len(map3d) == 0:
+        return map3d, map_des, map_obs, 0
+    keep = map_obs >= min_observations
+    culled = int(np.count_nonzero(~keep))
+    return map3d[keep], map_des[keep], map_obs[keep], culled
+
+
+def expand_map(map3d, map_des, map_obs, K,
+               key_kp, key_des, key_R, key_t,
+               curr_kp, curr_des, curr_R, curr_t,
+               max_point_distance=MAX_MAP_POINT_DISTANCE,
+               duplicate_radius=DUPLICATE_POINT_RADIUS):
     """
     Triangulate new 3D points from the last keyframe and append them to the map.
     
     Returns:
     map3d: updated Nx3 array of 3D point positions in the world frame
     map_des: updated NxD array of descriptors for the 3D points (from the current frame)
+    map_obs: updated observation counts for each map point
     n_new: number of new points added to the map
+    stats: filtering counts from the map hygiene pass
     """
     _, good = match(key_des, curr_des)
+    stats = {
+        "triangulated": 0,
+        "rejected_far": 0,
+        "rejected_duplicate": 0,
+    }
     if len(good) < 8:
-        return map3d, map_des, 0
+        return map3d, map_des, map_obs, 0, stats
 
     pts_key, pts_curr = matched_points(key_kp, curr_kp, good)
     new_pts3d, valid = triangulate_poses(K, key_R, key_t, pts_key, curr_R, curr_t, pts_curr)
     if len(new_pts3d) == 0:
-        return map3d, map_des, 0
+        return map3d, map_des, map_obs, 0, stats
 
     train_idx = np.array([good[j].trainIdx for j in range(len(good)) if valid[j]])
+    stats["triangulated"] = int(len(new_pts3d))
+
+    near_enough = _distance_filter(new_pts3d, max_point_distance)
+    stats["rejected_far"] = int(np.count_nonzero(~near_enough))
+    new_pts3d = new_pts3d[near_enough]
+    train_idx = train_idx[near_enough]
+    if len(new_pts3d) == 0:
+        return map3d, map_des, map_obs, 0, stats
+
+    unique = _duplicate_filter(new_pts3d, map3d, duplicate_radius)
+    stats["rejected_duplicate"] = int(np.count_nonzero(~unique))
+    new_pts3d = new_pts3d[unique]
+    train_idx = train_idx[unique]
+    if len(new_pts3d) == 0:
+        return map3d, map_des, map_obs, 0, stats
+
     new_des = curr_des[train_idx]
+    new_obs = np.full(len(new_pts3d), 2, dtype=np.int32)
 
     map3d = np.vstack([map3d, new_pts3d])
     map_des = np.vstack([map_des, new_des])
-    return map3d, map_des, len(new_pts3d)
+    map_obs = np.concatenate([map_obs, new_obs])
+    return map3d, map_des, map_obs, len(new_pts3d), stats

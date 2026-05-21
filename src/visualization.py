@@ -37,7 +37,7 @@ def show_inlier_matches(img1, kp1, img2, kp2, matches, inlier_mask, max_draw=50)
     cv2.imshow('Essential Matrix Inlier Matches', canvas)
 
 
-def plot_3d(points_3d, R, t):
+def plot_3d(points_3d, R, t, save_path=None):
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection='3d')
 
@@ -54,6 +54,10 @@ def plot_3d(points_3d, R, t):
     ax.set_box_aspect([1, 1, 1])
     ax.legend()
     plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved plot → {save_path}")
+    plt.ioff()
     plt.show()
 
 
@@ -221,7 +225,7 @@ class LiveSlamViewer:
             plt.close(self.fig)
 
 
-def plot_trajectory(trajectory, map_points=None, keyframes=None, max_keyframe_thumbs=8):
+def plot_trajectory(trajectory, map_points=None, keyframes=None, max_keyframe_thumbs=8, save_path=None):
     """Plot the camera trajectory and sparse map in 3D.
 
     trajectory: list of (R, t) where X_cam = R @ X_world + t.
@@ -283,4 +287,8 @@ def plot_trajectory(trajectory, map_points=None, keyframes=None, max_keyframe_th
     if has_keyframes:
         _draw_keyframe_strip(fig, grid[1, :], keyframes, max_keyframe_thumbs)
 
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved plot → {save_path}")
+    plt.ioff()
     plt.show()
